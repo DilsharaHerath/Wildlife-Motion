@@ -113,6 +113,7 @@ def save_by_individual(df: pd.DataFrame, output_dir: str) -> None:
 def main() -> None:
     df = load_data(DATA_PATH)
     df = drop_columns(df, COLUMNS_TO_DROP)
+    # df = parse_timestamps(df)   
     print(df.info())
     save_by_individual(df, OUTPUT_DIR)
 
