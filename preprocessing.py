@@ -2,10 +2,12 @@ import os
 import re
 
 import pandas as pd
-import numpy as np
 
 DATA_PATH = 'data/African elephants in Etosha National Park (data from Tsalyuk et al. 2018).csv'
-OUTPUT_DIR = 'data/individuals'
+OUTPUT_DIR = 'data/individuals1'
+INTERVAL_SUMMARY_PATH = 'data/individuals1/interval-summary.csv'
+MISSING_POINTS_PATH = 'data/individuals1/missing-points.csv'
+DAY_FILTER_SUMMARY_PATH = 'data/individuals1/day-filter-summary.csv'
 
 COLUMNS_TO_DROP = [
     'event-id',
@@ -16,11 +18,6 @@ COLUMNS_TO_DROP = [
     'tag-local-identifier',
     'study-name',
 ]
-
-EXPECTED_INTERVAL = pd.Timedelta(minutes=20)
-INTERVAL_TOLERANCE = pd.Timedelta(minutes=2)
-MAX_SPEED_KMH = 40.0
-
 
 def load_data(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
@@ -35,65 +32,30 @@ def sanitize_filename(value: str) -> str:
     return safe or 'unknown'
 
 
-def parse_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+def add_date_time_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if 'timestamp' not in df.columns:
+        raise KeyError('Missing required column: timestamp')
+
     df = df.copy()
-    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
-    return df.dropna(subset=['timestamp'])
+    timestamps = pd.to_datetime(df['timestamp'], errors='coerce')
+    df['date'] = timestamps.dt.date
+    df['time'] = timestamps.dt.time
+    df = df.drop(columns=['timestamp'])
+    return df
 
 
-def filter_coordinates(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.dropna(subset=['location-lat', 'location-long'])
-    mask = df['location-lat'].between(-90, 90) & df['location-long'].between(-180, 180)
-    return df[mask]
+def normalize_timestamps(df: pd.DataFrame, interval: str = '20min') -> pd.DataFrame:
+    if 'timestamp' not in df.columns:
+        raise KeyError('Missing required column: timestamp')
 
+    df = df.copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce').dt.floor(interval)
 
-def sort_and_dedup(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.sort_values('timestamp')
-    return df.drop_duplicates(subset=['timestamp', 'location-lat', 'location-long'])
+    if 'individual-local-identifier' in df.columns:
+        df = df.drop_duplicates(subset=['individual-local-identifier', 'timestamp'])
+    else:
+        df = df.drop_duplicates(subset=['timestamp'])
 
-
-def filter_interval(df: pd.DataFrame) -> pd.DataFrame:
-    diffs = df['timestamp'].diff()
-    keep = diffs.isna() | (diffs.sub(EXPECTED_INTERVAL).abs() <= INTERVAL_TOLERANCE)
-    return df[keep]
-
-
-def haversine_km(lat1, lon1, lat2, lon2) -> pd.Series:
-    radius_km = 6371.0088
-    lat1_rad = np.radians(lat1)
-    lon1_rad = np.radians(lon1)
-    lat2_rad = np.radians(lat2)
-    lon2_rad = np.radians(lon2)
-
-    dlat = lat2_rad - lat1_rad
-    dlon = lon2_rad - lon1_rad
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2) ** 2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    return radius_km * c
-
-
-def filter_speed(df: pd.DataFrame) -> pd.DataFrame:
-    if len(df) < 2:
-        return df
-
-    dist_km = haversine_km(
-        df['location-lat'].shift(),
-        df['location-long'].shift(),
-        df['location-lat'],
-        df['location-long'],
-    )
-    dt_hours = df['timestamp'].diff().dt.total_seconds() / 3600
-    speed_kmh = dist_km / dt_hours
-    keep = speed_kmh.isna() | (speed_kmh <= MAX_SPEED_KMH)
-    return df[keep]
-
-
-def preprocess_individual(df: pd.DataFrame) -> pd.DataFrame:
-    df = parse_timestamps(df)
-    df = filter_coordinates(df)
-    df = sort_and_dedup(df)
-    df = filter_interval(df)
-    df = filter_speed(df)
     return df
 
 
@@ -106,16 +68,107 @@ def save_by_individual(df: pd.DataFrame, output_dir: str) -> None:
         identifier_str = 'unknown' if pd.isna(identifier) else str(identifier)
         filename = f'{sanitize_filename(identifier_str)}.csv'
         output_path = os.path.join(output_dir, filename)
-        cleaned = preprocess_individual(group)
-        cleaned.to_csv(output_path, index=False)
+        group.to_csv(output_path, index=False)
+
+
+def summarize_intervals(df: pd.DataFrame) -> pd.DataFrame:
+    if 'individual-local-identifier' not in df.columns:
+        raise KeyError('Missing required column: individual-local-identifier')
+    if 'timestamp' not in df.columns:
+        raise KeyError('Missing required column: timestamp')
+
+    df = df.copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+
+    summaries = []
+    for identifier, group in df.groupby('individual-local-identifier', dropna=False):
+        identifier_str = 'unknown' if pd.isna(identifier) else str(identifier)
+        group = group.dropna(subset=['timestamp']).sort_values('timestamp')
+        diffs = group['timestamp'].diff().dt.total_seconds() / 60.0
+        diffs = diffs.dropna()
+        is_20min = diffs == 20.0
+
+        summaries.append(
+            {
+                'individual-local-identifier': identifier_str,
+                'points': int(group.shape[0]),
+                'intervals': int(diffs.shape[0]),
+                'interval_min': diffs.min() if not diffs.empty else None,
+                'interval_median': diffs.median() if not diffs.empty else None,
+                'interval_mean': diffs.mean() if not diffs.empty else None,
+                'interval_max': diffs.max() if not diffs.empty else None,
+                'interval_20min_count': int(is_20min.sum()) if not diffs.empty else 0,
+                'interval_20min_pct': (is_20min.mean() * 100.0) if not diffs.empty else None,
+            }
+        )
+
+    return pd.DataFrame(summaries)
+
+
+def summarize_missing_points(df: pd.DataFrame, expected_per_day: int = 72) -> pd.DataFrame:
+    required_columns = {'individual-local-identifier', 'date'}
+    missing = required_columns - set(df.columns)
+    if missing:
+        raise KeyError(f'Missing required columns: {sorted(missing)}')
+
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
+    df = df.dropna(subset=['date'])
+
+    counts = (
+        df.groupby(['individual-local-identifier', 'date'])
+        .size()
+        .reset_index(name='points')
+    )
+    counts['expected_points'] = expected_per_day
+    counts['missing_points'] = (expected_per_day - counts['points']).clip(lower=0)
+    return counts
+
+
+def filter_days_by_availability(
+    df: pd.DataFrame,
+    min_points_per_day: int = 65,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    required_columns = {'individual-local-identifier', 'date'}
+    missing = required_columns - set(df.columns)
+    if missing:
+        raise KeyError(f'Missing required columns: {sorted(missing)}')
+
+    df = df.copy()
+    df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
+    df = df.dropna(subset=['date'])
+
+    counts = (
+        df.groupby(['individual-local-identifier', 'date'])
+        .size()
+        .reset_index(name='points')
+    )
+    counts['kept'] = counts['points'] >= min_points_per_day
+    counts['min_points_required'] = min_points_per_day
+
+    kept_days = counts[counts['kept']]
+    filtered_df = df.merge(
+        kept_days[['individual-local-identifier', 'date']],
+        on=['individual-local-identifier', 'date'],
+        how='inner',
+    )
+
+    return filtered_df, counts
 
 
 def main() -> None:
     df = load_data(DATA_PATH)
     df = drop_columns(df, COLUMNS_TO_DROP)
-    # df = parse_timestamps(df)   
+    df = normalize_timestamps(df)
+    interval_summary = summarize_intervals(df)
+    df = add_date_time_columns(df)
+    df, day_filter_summary = filter_days_by_availability(df, min_points_per_day=65)
     print(df.info())
     save_by_individual(df, OUTPUT_DIR)
+    interval_summary.to_csv(INTERVAL_SUMMARY_PATH, index=False)
+    missing_points = summarize_missing_points(df)
+    missing_points.to_csv(MISSING_POINTS_PATH, index=False)
+    day_filter_summary.to_csv(DAY_FILTER_SUMMARY_PATH, index=False)
 
 
 if __name__ == '__main__':
